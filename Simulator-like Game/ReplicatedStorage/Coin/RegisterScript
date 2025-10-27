@@ -1,0 +1,74 @@
+-- Script
+
+-- [[
+--    RegisterScript.lua
+--    Made by sac_ie
+--]]
+
+-- This shouldn't be in every coin, but unfortunately I did it that way. Easily fixable
+
+local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
+
+local datastore = DataStoreService:GetDataStore("Coins")
+
+local debounce = false
+
+local function setData(player, data)
+	local success, errorMessage = pcall(function()
+		datastore:SetAsync(tostring(player.UserId), data)
+	end)
+
+	if success then
+		print("Data saved successfully")
+	else
+		warn("Error saving data: " .. errorMessage)
+	end
+end
+
+local function handleClick(player, coinMultiplier)
+	if debounce then return end
+
+	debounce = true
+	
+	if coinMultiplier == 0 then coinMultiplier = 1 end
+		
+	player.leaderstats.Coins.Value = player.leaderstats.Coins.Value + (1 * coinMultiplier)
+
+	debounce = false
+	script.Parent:Destroy()
+return end
+
+local busy = false
+
+script.Parent.ClickDetector.MouseClick:Once(function(player)
+	busy = true
+	local coinMultiplier = player.leaderstats.Multiplier.Value
+	if coinMultiplier then
+		handleClick(player, coinMultiplier)
+	else
+		warn("CoinMultiplier not found for " .. player.Name)
+		script.Parent:Destroy()
+	end
+end)
+
+script.Parent.Touched:Connect(function(touched)
+	local character = touched.Parent
+	if not character then return end
+	if busy then return end
+
+	local humanoid = character:FindFirstChildWhichIsA("Humanoid")
+	if humanoid then
+		local player = game.Players:GetPlayerFromCharacter(character)
+		if player then
+			busy = true
+			local coinMultiplier = player.leaderstats.Multiplier.Value
+			if coinMultiplier then
+				handleClick(player, coinMultiplier)
+			else
+				warn("CoinMultiplier not found for " .. player.Name)
+				script.Parent:Destroy()
+			end
+		end
+	end
+end)
