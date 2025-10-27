@@ -9,7 +9,7 @@
 --]]
 
 -- ⚠️ This is a sanitized version of the anti-cheat module for portfolio purposes.
--- Real thresholds, remote names, and other critical logic has been removed.
+-- Most real thresholds, remote names, and other critical logic has been removed.
 -- ... = redacted
 
 
@@ -134,5 +134,6 @@ task.spawn(function()
 		module.q[1] = nil
 	end
 end)
+
 
 return module
