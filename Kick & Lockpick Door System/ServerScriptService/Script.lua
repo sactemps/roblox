@@ -1,138 +1,158 @@
+-- Author: sac_ie
+
 local RS = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
-local Provider = game:GetService("KeyframeSequenceProvider")
+local KeyframeProvider = game:GetService("KeyframeSequenceProvider")
 local PhysicsService = game:GetService("PhysicsService")
 local ContentProvider = game:GetService("ContentProvider")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local Remotes = RS:WaitForChild("Remotes")
-local Doors = game.Workspace:WaitForChild("Doors")
-local Modules = ServerScriptService:WaitForChild("Modules")
 
 local Door = require(RS.Shared.Door)
+
+local Remotes = RS:WaitForChild("Remotes").Doors
+local Doors = game.Workspace:WaitForChild("Doors")
 
 local COLLISION_GROUP_DOORS = "Doors"
 local COLLISION_GROUP_PLAYERS = "Players"
 
-local REMOTE_DOOR_STATE = Remotes.Doors.State
-local REMOTE_ACTION = Remotes.Doors.Action
-local REMOTE_REQUEST_STATE = Remotes.Doors.RequestState
-local REMOTE_SYNC_STATE = Remotes.Doors.SyncState
+local REMOTE_DOOR_STATE = Remotes.State
+local REMOTE_ACTION = Remotes.Action
+local REMOTE_REQUEST_STATE = Remotes.RequestState
+local REMOTE_SYNC_STATE = Remotes.SyncState
 
-local doors = {}
+local activeDoors = {} -- [id] = Door instance
 
+-----------------------------
 -- Preload animations
-pcall(function()
-	local toload = {}
+-----------------------------
+
+local function preloadAnimations()
+	local lengthCache = {}
+	local toPreload = {}
 	
-	for action, actionData in pairs(Door.Actions) do
+	for _, actionData in pairs(Door.Actions) do
 		local animation = actionData.Animation
 		local animationId = actionData.AnimationId
-		
 		if not animation or not animationId then continue end
 		
-		animation.AnimationId = animationId
-		table.insert(toload, animation)
+		table.insert(toPreload, animation)
 		
-		local sequence = Provider:GetKeyframeSequenceAsync(animationId)
-		local keyframes = sequence:GetKeyframes()
-		
-		local length = 0
-		for i = 1, #keyframes do
-			if keyframes[i].Time > length then
-				length = keyframes[i].Time
+		if lengthCache[animationId] == nil then
+			local ok, result = pcall(function()
+				local sequence = KeyframeProvider:GetKeyframeSequenceAsync(animationId)
+				local keyframes = sequence:GetKeyframes()
+				
+				local length = 0
+				for _, keyframe in ipairs(keyframes) do
+					length = math.max(length, keyframe.Time)
+				end
+				
+				sequence:Destroy()
+				return length
+			end)
+			
+			if not ok then
+				warn(`Failed to measure animation {animationId}: {result}`)
 			end
+			
+			lengthCache[animationId] = ok and result or 0
 		end
 		
-		sequence:Destroy()
-		
-		actionData.AnimationLength = length
+		actionData.AnimationLength = lengthCache[animationId]
 	end
 	
-	ContentProvider:PreloadAsync(toload)	
-end)
+	pcall(function()
+		ContentProvider:PreloadAsync(toPreload)
+	end)
+end
+
+preloadAnimations()
+
+-----------------------------
+-- Collision groups
+-----------------------------
 
 pcall(function()
-	PhysicsService:CollisionGroupSetCollidable(
-		COLLISION_GROUP_DOORS,
-		COLLISION_GROUP_PLAYERS,
-		true
-	)
+	PhysicsService:CollisionGroupSetCollidable(COLLISION_GROUP_DOORS, COLLISION_GROUP_PLAYERS, true)
 end)
 
-REMOTE_ACTION.OnServerInvoke = function(plr: Player, data: any)
-	assert(typeof(data) == "table")
-	
-	local id = data.Id
-	assert(typeof(id) == "string")
-	
-	local door = doors[id]
-	if not door then return "Door not found" end
-	
-	door:action(plr, data)
-end
-
-function setDoorCollisionGroup(door: Model)
-	if typeof(door) == Instance
-		and door:IsA("Model")
-		and door.PrimaryPart then
-		primaryPart.CollisionGroup = COLLISION_GROUP_DOORS
+local function setDoorCollisionGroup(model: Model)
+	if model.PrimaryPart then
+		model.PrimaryPart.CollisionGroup = COLLISION_GROUP_DOORS
 	end
 end
 
-function setupDoor(door: Model)
-	if not isValidDoor(door) then return end
-	
-	setDoorCollisionGroup(door)
-	
-	local door = Door.new(door, {
+---------------------
+-- Door setup
+---------------------
+
+local function isValidDoor(instance: Instance)
+	return instance:IsA("Model") and instance:GetAttribute("__Door") == true
+end
+
+local function setupDoor(model: Instance)
+	if not isValidDoor(model) then return end
+
+	setDoorCollisionGroup(model :: Model)
+
+	local door = Door.new(model :: Model, {
 		Remotes = {
-			Action = REMOTE_ACTION;
-			StateEvent = REMOTE_DOOR_STATE;
-			RequestState = REMOTE_REQUEST_STATE;
-			SyncState = REMOTE_SYNC_STATE;
-		}
+			Action = Remotes.Action;
+			RequestState = Remotes.RequestState;
+			SyncState = Remotes.SyncState;
+		},
 	})
-	
-	doors[door.Id()] = door
-	
+
+	activeDoors[door:GetId()] = door
 	return door
 end
 
-function setupCharacter(character)
-	local function apply(part)
-		if typeof(part) == "Instance"
-			and part:IsA("BasePart") then
-			part.CollisionGroup = COLLISION_GROUP_PLAYERS
-		end
+for _, child in Doors:GetChildren() do
+	setupDoor(child)
+end
+Doors.ChildAdded:Connect(setupDoor)
+
+------------------------------
+-- Player collision groups
+------------------------------
+
+local function applyCollisionGroup(part: Instance)
+	if part:IsA("BasePart") then
+		part.CollisionGroup = COLLISION_GROUP_PLAYERS
 	end
-	
-	if typeof(character) == "Instance" then
-		for _, part in character:GetDescendants() do
-			apply(part)
-		end
-		
-		character.DescendantAdded:Connect(apply)
-	end	
 end
 
-function setupPlayer(player)
+local function setupCharacter(character: Model)
+	for _, part in ipairs(character:GetDescendants()) do
+		applyCollisionGroup(part)
+	end
+	character.DescendantAdded:Connect(applyCollisionGroup)
+end
+
+local function setupPlayer(player: Player)
+	if player.Character then
+		setupCharacter(player.Character)
+	end
 	player.CharacterAdded:Connect(setupCharacter)
 end
 
-function isValidDoor(door: Model)
-	if typeof(door) ~= "Instance"
-		and not door:IsA("Model") then
-		return false
-	end
-		
-	local isDoor = door:GetAttribute("__Door")
-	if not isDoor then return false end
-	
-	return true
+for _, player in ipairs(Players:GetPlayers()) do
+	setupPlayer(player)
 end
-
-for _, child in Doors:GetChildren() do setupDoor(child) end
-Doors.ChildAdded:Connect(setupDoor)
-
 Players.PlayerAdded:Connect(setupPlayer)
+
+------------------------------
+-- Client action requests
+------------------------------
+
+Remotes.Action.OnServerInvoke = function(player: Player, data: any)
+	if typeof(data) ~= "table" or typeof(data.Id) ~= "string" then
+		return { CODE = Door.Codes.INVALID_ACTION }
+	end
+
+	local door = activeDoors[data.Id]
+	if not door then
+		return { CODE = Door.Codes.DOOR_NOT_FOUND }
+	end
+
+	return door:Act(player, data)
+end
