@@ -1,397 +1,504 @@
+-- Author: sac_ie
+
 local CharmSync = require(game.ReplicatedStorage.Packages.CharmSync)
 local Charm = require(game.ReplicatedStorage.Packages.Charm)
+local atom = Charm.atom
 
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local CollectionService = game:GetService("CollectionService")
 
+local IS_SERVER = RunService:IsServer()
+
 local Door = {}
-
-local NONE = {__none = "__none"}
-
 Door.__index = Door
 
--- Codes used in identifying messages. Not always given: do not assume it will always be given.
+Door.NONE = {__none = "__none"}
+
 Door.Codes = {
-	STATE_UPDATE = "STATE_UPDATE";
-	NEW_DOOR = "NEW_DOOR";
-	READY = "READY";
-	CANNOT_KICK = "CANNOT_KICK";
+	STATE_UPDATE   = "STATE_UPDATE";
+	NEW_DOOR       = "NEW_DOOR";
+	READY          = "READY";
+	CANNOT_ACT     = "CANNOT_ACT";
+	ACTION_SUCCESS = "ACTION_SUCCESS";
+	ON_COOLDOWN    = "ON_COOLDOWN";
+	DOOR_NOT_FOUND = "DOOR_NOT_FOUND";
+	INVALID_ACTION = "INVALID_ACTION";
 }
-Door.Actions = {
-	Kick = {
-		Name = "Kick";
-		Animation = Instance.new("Animation");
-		AnimationId = "rbxassetid://136983861594940";
-	},
-	Lockpick = {
-		Name = "Lockpick";
-		Animation = Instance.new("Animation");
-		AnimationId = "rbxassetid://117726443207384";
-	}
-}
+
+-- Single source of truth for every field a door's atom starts with.
+-- `Action` links a transient flag (e.g. BeingKicked) to the action whose
+-- animation should play while that flag is true.
 Door.AtomMap = {
-	Id = { _ID = true };
-	Player = { DefaultValue = NONE };
-	Locked = { DefaultValue = true };
-	Open = { DefaultValue = false };
-	BeingPicked = { DefaultValue = false, Action = Door.Actions.Lockpick.Name };
-	BeingKicked = { DefaultValue = false, Action = Door.Actions.Kick.Name };
-	Kicked = { DefaultValue = false };
-	Cooldown = { DefaultValue = false };
-	PickProgress = { DefaultValue = 0 };
+	Id 			  = { Default = nil };
+	Model         = { Default = nil };
+	Player 		  = { Default = Door.NONE };
+	Locked        = { Default = true };
+	Open          = { Default = false };
+	Peeking       = { Default = false };
+	BeingPicked   = { Default = false, Action = "Lockpick" };
+	BeingKicked   = { Default = false, Action = "Kick" };
+	BeingKickedLP = { Default = false, Action = "KickOpen" };
+	Kicked        = { Default = false };
+	Cooldown      = { Default = false };
+	PickProgress  = { Default = 0 };
 }
 
-Door._newdoorpayload = { CODE = Door.Codes.NEW_DOOR }
-Door._stateupdatepayload = { CODE = Door.Codes.STATE_UPDATE }
-
-function Door.new(model, options: any)
-	assert(RunService:IsServer(), "Server-only function")
-	
-	assert(typeof(options) == "table", "Invalid options")
-	assert(typeof(options.Remotes) == "table", "Missing remotes")
-	
-	local self = setmetatable({}, Door)	
-		
-	self.Model = model
-	
-	for atomName, properties in pairs(self.AtomMap) do
-		if properties._ID then
-			self[atomName] = Charm.atom(HttpService:GenerateGUID(false))
-			continue	
-		end
-		
-		self[atomName] = Charm.atom(properties.DefaultValue)
-		
-		if atomName == "Kicked" then
-			local disconnect
-			disconnect = Charm.subscribe(self[atomName], function(new, prev)
-				if new and not prev then -- If the Kicked state changes from false to true then:
-					self.Model.PrimaryPart.Anchored = false
-					self.Model.Hinge.HingeConstraint.ServoMaxTorque = 0
-					self.Model.PrimaryPart:ApplyAngularImpulse(Vector3.new(0, 150, 0))
-					disconnect()
-				end
-			end)
-		end
+local function buildDefaultState()
+	local state = {}
+	for key, meta in pairs(Door.AtomMap) do
+		state[key] = meta.Default
 	end
+	return state
+end
+
+---------------------------------
+-- Actions
+---------------------------------
+
+local function isIdle(state)
+	return not state.BeingKicked and not state.BeingPicked
+end
 	
-	self._stateevent = options.Remotes.StateEvent
+Door.Actions = {}
+
+Door.Actions.Kick = {
+	Name = "Kick";
+	Key = Enum.KeyCode.R;
+	AnimationId = "rbxassetid://136983861594940";
+	Animation = nil;
+	AnimationLength = 2;
 	
-	-- Replace animations (by default: nil) with an Animation instance
-	for k, actionData in pairs(self.Actions) do
+	Requires = function(state)
+		return state.Locked == true
+			and not state.Cooldown
+			and not state.Kicked
+			and isIdle(state)
+	end;
+	
+	Perform = function(door, player)
+		door:_kickSequence(player)
+	end,
+}
+
+Door.Actions.Lockpick = {
+	Name = "Lockpick";
+	Key = Enum.KeyCode.E;
+	AnimationId = "rbxassetid://117726443207384";
+	Animation = nil;
+
+	Requires = function(state)
+		return state.Locked == true
+			and not state.Cooldown
+			and not state.Kicked
+			and isIdle(state)
+	end;
+
+	Perform = function(door, player)
+		door:_lockpickSequence(player)
+	end;
+}
+
+-- Lockpick Sub-action
+Door.Actions.Peek = {
+	Name = "Peek";
+	Key = Enum.KeyCode.F;
+	AnimationId = nil;
+	Animation = nil;
+
+	Requires = function(state)
+		print(state.Locked == false)
+		print(state.Kicked == false)
+		print(state.Open == false)
+		print(isIdle(state))
+		
+		return state.Locked == false
+			and state.Kicked == false
+			and state.Open == false
+			and state.Peeking == false
+			and isIdle(state)
+	end;
+
+	Perform = function(door, player)
+		door:_peekSequence(player)
+	end;
+}
+
+-- Lockpick Sub-action
+Door.Actions.StopPeeking = {
+	Name = "StopPeeking";
+	Key = Enum.KeyCode.F;
+	AnimationId = nil;
+	Animation = nil;
+	
+	Requires = function(state)
+		return state.Locked == false
+			and state.Kicked == false
+			and state.Open == false
+			and state.Peeking == true
+			and isIdle(state)
+	end;
+	
+	Perform = function(door, player)
+		door:_peekSequence(player)
+	end,
+}
+
+-- Lockpick Sub-action
+Door.Actions.KickOpen = {
+	Name = "KickOpen";
+	Key = Enum.KeyCode.Q;
+	AnimationId = "rbxassetid://136983861594940";
+	Animation = nil;
+	AnimationLength = 1;
+
+	Requires = function(state)
+		return state.Locked == false
+			and state.Kicked == false
+			and state.Open == false
+			and state.Peeking == false
+			and not state.Cooldown
+			and isIdle(state)
+	end;
+
+	Perform = function(door, player)
+		door:_kickOpenSequence(player)
+	end;
+}
+
+-- Load animations
+for _, actionData in pairs(Door.Actions) do
+	if actionData.AnimationId then
 		local animation = Instance.new("Animation")
 		animation.AnimationId = actionData.AnimationId
-		
-		self.Actions[k].Animation = animation
+		actionData.Animation = animation
 	end
+end
+
+
+------------------------------------
+-- The module
+------------------------------------
+
+function Door.new(model: Model, options: any)
+	assert(IS_SERVER, "Server-only function")
+	assert(typeof(options) == "table", "Invalid options")
+	assert(typeof(options.Remotes) == "table", "Missing options.Remotes")
 	
-	self:AddToCollection("KickableDoors", "LockpickableDoors")
-	self:StartSyncer(options.Remotes)
+	local self = setmetatable({}, Door)	
+	self.Remotes = options.Remotes
+
+	local initial = buildDefaultState()
+	initial.Id = HttpService:GenerateGUID(false)
+	initial.Model = model
+	
+	self.State = atom(initial)
+	
+	model:SetAttribute("id", self:GetId())
+	
+	self:_startSyncer({ self.State })
+	self:_watchStateChanges()
+	
+	CollectionService:AddTag(model, "Doors")
 	
 	return self
 end
 
-function Door:AddToCollection(...)
-	assert(RunService:IsServer(), "Server-only function")
+------------------------
+-- Accessor functions
+------------------------
 
-	if not ... then return end
-	local collections = {...}
+function Door:GetId()
+	return self.State().Id
 	
-	for _, collection in ipairs(collections) do
-		CollectionService:AddTag(self.Model, collection)
-	end
 end
 
-function Door:RemoveFromCollection(...)
-	assert(RunService:IsServer(), "Server-only function")
-
-	if not ... then return end
-	local collections = {...}
-	
-	for _, collection in ipairs(collections) do
-		CollectionService:RemoveTag(self.Model, collection)
-	end
+function Door:GetModel()
+	return self.State().Model
 end
 
-function Door:action(plr: Player, data: any)
-	assert(RunService:IsServer(), "Server-only function")
+function Door:GetCooldown()
+	return self.State().Cooldown
+	
+end
 
-	assert(typeof(data) == "table", "Invalid data")
+--------------------------
+-- State changes
+--------------------------
 
-	if data.Id ~= self.Id() then
-		return
-	end
-
-	print("EVENT RECIEVED")
-
-	local rawAction = data.Action
-	local action = Door.Actions[rawAction]
-
-	assert(
-		typeof(rawAction) == "string" and
-			action,
-		"Invalid action"
-	)
-
-	if self.Cooldown() then
-		return {
-			CODE = Door.Codes.ON_COOLDOWN
-		}
-	end
-
-	if self.BeingKicked() or
-		self.BeingPicked() or
-		self.Kicked() then
-		return {
-			CODE = Door.Codes.CANNOT_KICK
-		}
+function Door:UpdateState(patch)
+	assert(IS_SERVER, "Server-only function")
+	
+	local current = self.State()
+	local updated = table.clone(current)
+	
+	for k, v in pairs(patch) do
+		updated[k] = v
 	end
 	
-	if action == Door.Actions.Kick then
-		self:Kick(plr)
-	elseif action == Door.Actions.Lockpick then
-		self:StartLockpick(plr)
-	end
+	self.State(updated)
 end
 
-function Door:StartLockpick(player)
-	assert(RunService:IsServer(), "Server-only function")
-	
-	warn(`StartLockpick`)
-	
-	if not self.Locked() then return end
-	if self.Cooldown() then return end
-	
-	self:RemoveFromCollection("KickableDoors", "LockpickableDoors")
-	
-	self.BeingPicked(true)
-	
-	task.spawn(function()
-		for i = 1, 100 do
-			if not self.BeingPicked() then return end
-			
-			self.PickProgress(i)
-			
-			task.wait(0.1)
-		end
-		
-		self.Locked(false)
-		self.BeingPicked(false)
-		self.PickProgress(0)
-	end)
-end
+----------------------------------
+-- Sync merges
+----------------------------------
 
-function Door:Kick(player)
-	assert(RunService:IsServer(), "Server-only function")
-	
-	warn(`Kick`)
-
-	if not self.Locked() then return end
-	if self.Cooldown() then return end
-	
-	self:RemoveFromCollection("KickableDoors", "LockpickableDoors")
-	
-	local character = player.Character
-	local humanoid = nil
-	local humanoidRootPart = nil
-	
-	xpcall(function()
-		if character then
-			humanoid = character:FindFirstChildWhichIsA("Humanoid")
-			humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
-			
-			humanoid.WalkSpeed = 0
-			humanoid.JumpPower = 0
-		end
-		
-		local playerPosition = self.Model:FindFirstChild("PlayerPosition")
-		if playerPosition then
-			humanoidRootPart.Anchored = true
-			humanoidRootPart.CFrame = playerPosition.CFrame
-		end
-	end, function(err)
-		warn(`Error during door kick: {err}`)
-	end)
-	
-	Charm.batch(function()
-		self.Player(player)
-		self.Locked(false)
-		self.Cooldown(true)
-		self.BeingKicked(true)
-	end)
-	
-	local _delay = Door.Actions.Kick.AnimationLength or 2
-	
-	task.delay(_delay, function()
-		xpcall(function()
-			if humanoid then
-				humanoid.WalkSpeed = 16
-				humanoid.JumpPower = 50
-			end
-			
-			humanoidRootPart.Anchored = false
-		end, function(err)
-			warn(`Error during door kick: {err}`)
-		end)
-		
-		Charm.batch(function()
-			self.Player(NONE)
-			self.BeingKicked(false)
-			self.Kicked(true)
-			self.Cooldown(false)
-		end)
-	end)
-end
-
--- Returns state data that can be securely replicated to client users.
-function Door:GetSharableData()
-	return {
-		Model = self.Model;
-		Id = self.Id();
-		AtomMap = {
-			Player = self.Player();
-			Id = self.Id();
-			Locked = self.Locked();
-			Open = self.Open();
-			BeingPicked = self.BeingPicked();
-			BeingKicked = self.BeingKicked();
-			Kicked = self.Kicked();
-			Cooldown = self.Cooldown();
-			PickProgress = self.PickProgress();
-		}
-	}
-end
-
--- Returns atoms with values that can be securely replicated to clients.
-function Door:GetSharableAtoms()
-	return {
-		Id = self.Id;
-		Player = self.Player;
-		Locked = self.Locked;
-		Open = self.Open;
-		BeingPicked = self.BeingPicked;
-		BeingKicked = self.BeingKicked;
-		Kicked = self.Kicked;
-		Cooldown = self.Cooldown;
-		PickProgress = self.PickProgress;
-	}
-end
-
--- Helper function to compress multiple tables into one.
-function Door:Compress(...)
+function Door.Merge(...)
 	local result = {}
-	
-	for _, item in ipairs({...}) do
+	for _, item in ipairs({ ... }) do
 		if typeof(item) == "table" then
 			for key, value in pairs(item) do
 				result[key] = value
 			end
 		end
 	end
-	
 	return result
 end
 
--- Returns the RemoteEvent associated with the door (or nil) and a boolean of whether or not the remote is "active" (can be fired)
-function Door:GetStateRemote()
-	assert(RunService:IsServer(), "Server-only function")
+--------------------------------------
+-- Client entry point for actions
+--------------------------------------
 
-	local _stateevent = self._stateevent
-	if typeof(_stateevent) == "Instance" and
-		_stateevent:IsA("RemoteEvent") then
-		return _stateevent, true
+function Door:Act(player: Player, data: any)
+	assert(IS_SERVER, "Server-only function")
+	assert(typeof(data) == "table", "Invalid data")
+	
+	if data.Id ~= self:GetId() then
+		return { CODE = Door.Codes.DOOR_NOT_FOUND }
 	end
-	return nil, false
-end
+	
+	local actionName = data.Action
+	local action = typeof(actionName) == "string" and Door.Actions[actionName]
 
--- Deprecated
-function Door:GetActionFunction()
-	assert(RunService:IsServer(), "Server-only function")
-
-	local _actionfunction = self._actionfunction
-	if typeof(_actionfunction) == "Instance" and
-		_actionfunction:IsA("RemoteFunction") then
-		return _actionfunction, true
+	if not action then
+		return { CODE = Door.Codes.INVALID_ACTION }
 	end
-	return nil, false
+
+	if self:GetCooldown() then
+		return { CODE = Door.Codes.ON_COOLDOWN }
+	end
+
+	if not action.Requires(self.State()) then
+		return { CODE = Door.Codes.CANNOT_ACT }
+	end
+
+	action.Perform(self, player)
+
+	return { CODE = Door.Codes.ACTION_SUCCESS }
 end
 
-function Door:GetActionFromAtomName(name: string)
-	return self.AtomMap[name].Action
-end
+---------------------------------
+-- Actions
+---------------------------------
 
--- Deprecated
-function Door:UpdateAllClients(...)
-	assert(RunService:IsServer(), "Server-only function")
+function Door:_lockpickSequence(player)
+	self:UpdateState({ BeingPicked = true })
 	
-	local additionalData = typeof(...) == "table" and ... or {}
-	
-	warn(`Pushing update`)
-	
-	local remote, exists = self:GetStateRemote()
-	if exists then
+	task.spawn(function()
+		for i = 1, 100 do
+			print(i)
+			if not self.State().BeingPicked then return end
+			
+			self:UpdateState({ PickProgress = i })
+			task.wait(0.001)
+		end
 		
-		local sharable = self:GetSharableData()
+		print(1)
 		
-		local payload = self:Compress(sharable, additionalData)
+		self:UpdateState({
+			Locked = false;
+			BeingPicked = false;
+			PickProgress = 0;
+		})
 		
-		remote:FireAllClients(payload)
-	end
-end
-
--- Deprecated
-function Door:UpdateClient(plr: Player, ...)
-	assert(RunService:IsServer(), "Server-only function")
-
-	local additionalData = typeof(...) == "table" and ... or {}
-
-	warn(`Pushing client update`)
-	
-	local remote, exists = self:GetStateRemote()
-	if exists then
-		remote:FireClient(plr,
-			self:Compress(
-				self:GetSharableData(),
-				...
-			)
-		)
-	end
-end
-
--- Deprecated
-function Door:UpdateOnPlayerJoin()
-	assert(RunService:IsServer(), "Server-only function")
-
-	game.Players.PlayerAdded:Connect(function(plr)
-		self:UpdateClient(plr, self._newdoorpayload)
+		print(self.State().Locked)
 	end)
 end
 
-function Door:StartSyncer(remotes)
-	assert(RunService:IsServer(), "Server-only function")
-	
-	local syncer = CharmSync.server({
-		atoms = self:GetSharableAtoms(),
-		interval = 0,
-		preserveHistory = false,
-		autoSerialize = true
+function Door:_kickSequence(player)
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+	local ok, err = pcall(function()
+		if humanoid then
+			humanoid.WalkSpeed = 0
+			humanoid.JumpPower = 0
+		end
+
+		local playerPosition = self:GetModel():FindFirstChild("PlayerPosition")
+		if playerPosition and rootPart then
+			rootPart.Anchored = true
+			rootPart.CFrame = playerPosition.CFrame
+		end
+	end)
+	if not ok then warn(`Error during door kick setup: {err}`) end
+
+	self:UpdateState({
+		Player = player;
+		Locked = false;
+		Cooldown = true;
+		BeingKicked = true;
+	})
+
+	local duration = Door.Actions.Kick.AnimationLength or 2
+
+	task.delay(duration, function()
+		local ok2, err2 = pcall(function()
+			if humanoid then
+				humanoid.WalkSpeed = 16
+				humanoid.JumpPower = 50
+			end
+			if rootPart then
+				rootPart.Anchored = false
+			end
+		end)
+		if not ok2 then warn(`Error resetting player after kick: {err2}`) end
+
+		self:UpdateState({
+			Player = Door.NONE;
+			BeingKicked = false;
+			Kicked = true;
+			Open = true;
+			Cooldown = false;
+		})
+	end)
+end
+
+function Door:_peekSequence(player)
+	self:UpdateState({ Peeking = not self.State().Peeking })
+end
+
+function Door:_kickOpenSequence(player)
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+	local ok, err = pcall(function()
+		if humanoid then
+			humanoid.WalkSpeed = 0
+			humanoid.JumpPower = 0
+		end
+
+		local playerPosition = self:GetModel():FindFirstChild("PlayerPosition")
+		if playerPosition and rootPart then
+			rootPart.Anchored = true
+			rootPart.CFrame = playerPosition.CFrame
+		end
+	end)
+	if not ok then warn(`Error during door kick open setup: {err}`) end
+
+	self:UpdateState({
+		Player = player;
+		Cooldown = true;
+		BeingKickedLP = true;
 	})
 	
-	self.__Syncer = syncer
-	
-	syncer:connect(function(plr, ...)
-		remotes.SyncState:FireClient(plr, self:Compress({ Id = self.Id(), Model = self.Model }, ...))
-	end)
+	local duration = Door.Actions.KickOpen.AnimationLength or 1
 
-	remotes.RequestState.OnServerEvent:Connect(function(plr)
-		syncer:hydrate(plr)
+	task.delay(duration, function()
+		local ok2, err2 = pcall(function()
+			if humanoid then
+				humanoid.WalkSpeed = 16
+				humanoid.JumpPower = 50
+			end
+			if rootPart then
+				rootPart.Anchored = false
+			end
+		end)
+		
+		if not ok2 then warn(`Error resetting player after kick open: {err2}`) end
+
+		self:UpdateState({
+			Player = Door.NONE;
+			Open = true;
+			Cooldown = false;
+			BeingKickedLP = false;
+		})
 	end)
 end
 
--- Deprecated
-function Door:StartRemotes(remotes)
-	assert(RunService:IsServer(), "Server-only function")
+--------------------------------------------------------------------------
+-- Physical state change effects
+--------------------------------------------------------------------------
+
+local function getHinge(model: Model)
+	local primary = model.PrimaryPart
+	local hingePart = model:FindFirstChild("Hinge")
+	local constraint = hingePart and hingePart:FindFirstChildWhichIsA("HingeConstraint")
+
+	if primary and primary:IsA("BasePart") and constraint then
+		return primary, constraint
+	end
+	return nil, nil
+end
+
+function Door:_watchStateChanges()
+	Charm.subscribe(self.State, function(state, prev)
+		local diff = {}
+		for key, val in pairs(state) do
+			if prev[key] ~= val then
+				diff[key] = val
+			end
+		end
+
+		local model = self:GetModel()
+		local primary, hinge = getHinge(model)
+		if not primary or not hinge then return end
+		
+		-- Door kicked
+		if diff.Kicked == true then
+			print("Kicking the door open")
+			primary.Anchored = false
+			hinge.ServoMaxTorque = 0
+			primary:ApplyAngularImpulse(Vector3.new(0, 180, 0))
+		end
+		
+		-- Peeking the door open
+		if diff.Peeking ~= nil and not state.Kicked then
+			print("Peeking through the door")
+			primary.Anchored = false
+			hinge.ActuatorType = Enum.ActuatorType.Servo
+			hinge.ServoMaxTorque = 5000
+			hinge.AngularSpeed = 4
+			hinge.TargetAngle = diff.Peeking and 15 or 0
+		end
+		
+		-- Kick the door fully open
+		if diff.Open == true and not state.Kicked then
+			print("Kicking fully open")
+			primary.Anchored = false
+			hinge.ServoMaxTorque = 0
+			primary:ApplyAngularImpulse(Vector3.new(0, 180, 0))
+		end
+	end)
+end
+
+---------------------------
+-- Networking
+---------------------------
+
+function Door:_startSyncer(atoms)
+	local syncer = CharmSync.server({
+		atoms = atoms,
+		interval = 0,
+		preserveHistory = false,
+		autoSerialize = true,
+	})
+
+	self.__Syncer = syncer
+
+	syncer:connect(function(player, ...)
+		-- `...` must stay last in the call to expand fully
+		local payloads = { ... }
+		table.insert(payloads, { Id = self:GetId() })
+		self.Remotes.SyncState:FireClient(player, Door.Merge(table.unpack(payloads)))
+	end)
+
+	self.Remotes.RequestState.OnServerEvent:Connect(function(player, doorId)
+		if doorId ~= self:GetId() then return end
+		syncer:hydrate(player)
+	end)
 end
 
 return Door
