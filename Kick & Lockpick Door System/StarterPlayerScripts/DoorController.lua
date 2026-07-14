@@ -1,319 +1,242 @@
+-- Author: sac_ie
+
+local Door = require(game.ReplicatedStorage.Shared.Door)
+
+local Charm = require(game.ReplicatedStorage.Packages.Charm)
+local CharmSync = require(game.ReplicatedStorage.Packages.CharmSync)
+local atom = Charm.atom
+
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
 
-local Charm = require(game.ReplicatedStorage.Packages.Charm)
-local CharmSync = require(game.ReplicatedStorage.Packages.CharmSync)
-
-local Door = require(game.ReplicatedStorage.Shared.Door)
-
+local LocalPlayer = game.Players.LocalPlayer
 local Remotes = game.ReplicatedStorage.Remotes.Doors
 
-local DoorsWithInteractions = {}
+local DISTANCE = 5
+local POLL_INTERVAL = 0.5
+local INPUT_DEBOUNCE = 0.5
 
-local __DoorStates = {}
+-----------------------------
+-- Door states keyed by ID
+-----------------------------
 
-local DoorStates = setmetatable({}, {
-	__index = __DoorStates,
-	__newindex = function(_, k, v)
-		__DoorStates[k] = v
-	end,
-})
+local doorStates = {} --[id] = { Model, Syncer, Atom } 
 
--- Returns the first instance where key.Model == model, from DoorStates
-function GetStateFromModel(model: Model)
-	for id, data in pairs(__DoorStates) do
-		if data.Model == model then
-			return { Id = id, data = data }
+--task.spawn(function()
+--	while true do
+--		task.wait(1)
+		
+--		for id, entry in pairs(doorStates) do
+--			print(entry.Atom())
+--		end
+--	end
+--end)
+
+local function getStateByModel(model: Model)
+	for id, entry in pairs(doorStates) do
+		if entry.Model == model then
+			return id, entry
 		end
 	end
+	return nil, nil
 end
 
--- Power house of starting animations & similar on the client
-function SubscribeToAtom(doorId: any, actionName: any, atom: any)
-	if typeof(actionName) ~= "string" then return print("NOT STRING") end
+local function playActionFeedback(flagName: string, player: Player)
+	local meta = Door.AtomMap[flagName]
+	local action = meta and meta.Action and Door.Actions[meta.Action]
+	if not action or not action.Animation then return end
 	
-	local action = Door.Actions[actionName]
-	if not action then return print("NOT FOUND") end
+	local character = player and player.Character
+	local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+	local animator = humanoid and humanoid:FindFirstChild("Animator")
+	if not animator then return end
 	
-	local animation = action.Animation
-	
-	print(`Starting subscriber for {actionName} ({atom()})`)
-	
-	 Charm.subscribe(atom, function(state, prev)
-		print(`Subscriber hit for {actionName}`)
-		print(`{state} {prev}`)
-				
-		local state = DoorStates[doorId]
-		
-		local player = state.Atoms.Player()
-		if CharmSync.isNone(player) or player == nil then
-			return print("PLAYER NOT FOUND")
+	local track = animator:LoadAnimation(action.Animation)
+	track.Looped = false
+	track:Play()
+end
+
+function subscribeToDoorAtom(doorAtom: Charm.Atom<any>)	
+	Charm.subscribe(doorAtom, function(state, prev)
+		for key, val in pairs(state) do
+			if prev[key] ~= val and val == true then
+				if Door.AtomMap[key] and Door.AtomMap[key].Action then
+					playActionFeedback(key, state.Player)
+				end
+			end
 		end
-		
-		print(player)
-		
-		local character = player.Character
-		print(character)
-		if not character then return end
-		
-		local humanoid = character:FindFirstChildWhichIsA("Humanoid")
-		print(humanoid)
-		if not humanoid then return end
-		
-		local animator = humanoid:FindFirstChild("Animator")
-		
-		animation.AnimationId = action.AnimationId
-		
-		local animationTrack = animator:LoadAnimation(animation)
-		animationTrack.Looped = false
-		
-		animationTrack:Play()
 	end)
-	
 end
 
-Remotes.SyncState.OnClientEvent:Connect(function(...)	
-	local payload = ...
-	
+Remotes.SyncState.OnClientEvent:Connect(function(payload)	
 	local id = payload.Id
+	assert(id, "Sync payload missing ID")
 	
-	assert(id)
-		
-	local data = payload.data
-	local type = payload.type
+	local kind = payload.type
 	
-	if type == "init" then
-		local model = payload.Model
+	if kind == "init" then
+		local data = payload.data[1]
 		
-		local atoms = {
-			Id = Charm.atom(),
-			Player = Charm.atom(),
-			Locked = Charm.atom(),
-			Open = Charm.atom(),
-			BeingPicked = Charm.atom(),
-			BeingKicked = Charm.atom(),
-			Kicked = Charm.atom(),
-			Cooldown = Charm.atom(),
-			PickProgress = Charm.atom(),
-		}
-
+		local doorAtom = atom(data)
 		local syncer = CharmSync.client({
-			atoms = atoms,
+			atoms = { doorAtom },
 			ignoreUnhydrated = false
 		})
 
-		DoorStates[id] = {
-			Model = model,
+		doorStates[id] = {
+			Model = data.Model,
 			Syncer = syncer,
-			Atoms = atoms
+			Atom = doorAtom
 		}
-		
-		for name, atom in pairs(atoms) do
-			local action = Door.AtomMap[name].Action
-			if action then
-				print(action)
-				SubscribeToAtom(id, action, atom)
-			end
+
+		subscribeToDoorAtom(doorAtom)
+	elseif kind == "patch" then
+		local entry = doorStates[id]
+		if not entry then 
+			warn(`Patch received for unknown door {id}`)
+			return
 		end
- 	elseif type == "patch" then
-		local state = DoorStates[id]
-		if not state then return print("no state") end
 		
-		local syncer = state.Syncer
-		if not syncer then return print("no syncer") end
-		
-		print(data)
-		
-		syncer:sync(...)
+		entry.Syncer:sync(payload)
 	end
 end)
 
-local selectedDoor = {
-	Door = nil;
-	Interactions = {
-		--EXAMPLE = {
-		--	Key = nil;
-		--	Callback = nil;
-		--  Exhausted = false;
-		--  Gui = nil;
-		--  Hint = nil;
-		--}
-	}
+CollectionService:GetInstanceAddedSignal("Doors"):Connect(function(instance)
+	Remotes.RequestState:FireServer(instance:GetAttribute("id"))
+end)
+
+local selected = {
+	Model = nil :: Model?,
+	Id = nil :: string?,
+	Interactions = {} :: { [string]: { Key: Enum.KeyCode, Callback: () -> (), Exhausted: boolean } };
 }
 
--- Pass the name of the interaction. Pass `true` to remove all interactions.
-function RemoveInteraction(nameOrAll: string | true)
-	assert(selectedDoor, "Can't remove an interaction without a door selected")
+local function setPromptVisible(door: Model, actionName: string, visible: boolean)
+	local folder = door:FindFirstChild("Interactions")
+	local node = folder and folder:FindFirstChild(actionName)
+	if not node then return end
 	
-	local model = selectedDoor.Model
-	local interactions = selectedDoor.Interactions
+	local hint = node:FindFirstChild("HintPart")
+	local gui = node:FindFirstChild("InteractionGui")
 	
-	if nameOrAll == true then
-		for _, interaction in pairs(selectedDoor.Interactions) do
-			if interaction.Gui then interaction.Gui.Enabled = false end
-			if interaction.Hint then interaction.Hint.Transparency = 1 end
+	if hint then hint.Transparency = visible and 0 or 1 end
+	if gui then
+		gui.Enabled = visible
+		local keyLabel = gui:FindFirstChild("KeyFrame") and gui.KeyFrame:FindFirstChild("Key") or gui:FindFirstChild("Key")
+		if visible and keyLabel then
+			keyLabel.Text = Door.Actions[actionName].Key.Name
 		end
-		selectedDoor.Interactions = {}
-	elseif nameOrAll ~= nil then
-		if interactions[nameOrAll].Gui then interactions[nameOrAll].Gui.Enabled = false end
-		if interactions[nameOrAll].Hint then interactions[nameOrAll].Hint.Transparency = 1 end
-		interactions[nameOrAll] = nil
 	end
 end
 
-function AddInteraction(name: string, key: string, callback)
-	assert(selectedDoor, "Can't add an interaction without a door selected")
-	
-	local model = selectedDoor.Model
-	local interactions = selectedDoor.Interactions
-	
-	interactions[name] = {
-		Key = key;
+local function clearInteractions()
+	if selected.Model then
+		for actionName in pairs(selected.Interactions) do
+			setPromptVisible(selected.Model, actionName, false)
+		end
+	end
+	selected.Interactions = {}
+end
+
+local function setInteraction(door: Model, actionName: string, callback: () -> ())
+	selected.Interactions[actionName] = {
+		Key = Door.Actions[actionName].Key;
 		Callback = callback;
 		Exhausted = false;
-		Gui = nil;
-		Hint = nil;
 	}
+	setPromptVisible(door, actionName, true)
 end
 
-local DISTANCE = 5
+-------------------------------------------
+-- Actions that are allowed for a given door's state
+-------------------------------------------
 
-RunService.RenderStepped:Connect(function()
-	local character = game.Players.LocalPlayer.Character
-	local humanoidRootPart = character and character.HumanoidRootPart or nil
-	
-	local _doors = {
-		Kickable = CollectionService:GetTagged("KickableDoors"),
-		Lockpickable = CollectionService:GetTagged("LockpickableDoors")
-	}
-	local doors = {}
-	
-	-- Make doors directly indexable by model, rather than index. For practical purposes.
-	for section, __doors in pairs(_doors) do
-		doors[section] = {}
-		for _, door in ipairs(__doors) do
-			doors[section][door] = true
+local function getAvailableActions(stateData)
+	local available = {}
+	--print(stateData)
+	for name, action in pairs(Door.Actions) do
+		if action.Requires(stateData) then
+			table.insert(available, name)
 		end
 	end
-	
-	local combined = Door:Compress(doors.Kickable, doors.Lockpickable)
-		
-	if selectedDoor.Door then
-		if not combined[selectedDoor.Door] then RemoveInteraction(true); print("Removing all")
-		
-		elseif not doors.Kickable[selectedDoor.Door] then RemoveInteraction("Kick"); print("Not kickable")
-		elseif not doors.Lockpickable[selectedDoor.Door] then RemoveInteraction("Lockpick"); print("Not lockpickable")
-		end	
-	end
-	
-	local closestDoor = {
-		Door = nil,
-		Distance = nil,
-	}
-	local doorsWithinDistance = {}
-	
-	-- Find doors that are within distance and can be interacted with
-	for door, _ in pairs(combined) do
-		local state = GetStateFromModel(door)
-		if not state then continue end
-		
-		if character and humanoidRootPart then
-			local primaryPart = door.PrimaryPart
-			if not primaryPart then continue end
-			
-			local dist = (primaryPart.Position - humanoidRootPart.Position).Magnitude
-			
-			if dist < DISTANCE then
-				if closestDoor.Door then
-					if dist < closestDoor.Distance then
-						closestDoor.Door = door
-						closestDoor.Distance = dist
-						closestDoor.State = state
-					end
-				else
-					closestDoor.Door = door
-					closestDoor.Distance = dist
-					closestDoor.State = state
-				end
-			end
-		end
-	end
-	
-	if not closestDoor.Door then
-		RemoveInteraction(true)
-		selectedDoor.Door = nil
-	else
-		local door = closestDoor.Door
-		local state = closestDoor.State
-		if selectedDoor.Door ~= door then
-			RemoveInteraction(true)
-			selectedDoor.Door = door
-			
-			if doors.Kickable[door] then
-				print("Kickable")
-				AddInteraction("Kick", Enum.KeyCode.R, function()
-					print(Remotes.Action:InvokeServer({ Id = state.Id, Action = "Kick" }))
-				end)
-			end
-			if doors.Lockpickable[door] then
-				print("Lockpickable")
-				AddInteraction("Lockpick", Enum.KeyCode.E, function()
-					print(Remotes.Action:InvokeServer({ Id = state.Id, Action = "Lockpick" }))
-				end)
-			end
-		end
-	end
-	
-	pcall(function()
-		if selectedDoor.Door then
-			local door = selectedDoor.Door
-			
-			local interactionFolder = door.Interactions
-			if not interactionFolder then return end
-			
-			for name, data in pairs(selectedDoor.Interactions) do
-				local specific = interactionFolder[name]
-				if not specific then continue end
-				
-				local hintPart = specific:FindFirstChild("HintPart")
-				local gui = specific.InteractionGui
-				
-				if not gui or not gui:IsA("BillboardGui") then return end
-				
-				data.Gui = gui
-				data.Hint = hintPart
-				
-				if data.Exhausted then
-					gui.Enabled = false
-					hintPart.Transparency = 1
-				else
-					if hintPart then
-						hintPart.Transparency = 0
-					end
-					gui.Key.Text = data.Key.Name
-					gui.Enabled = true
-				end
-			end
-		end
-	end)
-end)
+	return available
+end
 
-UserInputService.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
-	if not selectedDoor.Door then return end
-		
-	for name, data in pairs(selectedDoor.Interactions) do
-		if data.Key == input.KeyCode then 
-			if data.Exhausted then return end
-			data.Exhausted = true
-			data.Callback()
-		end
-	end
-end)
+--------------------------------------------
+-- Proximity loop
+--------------------------------------------
 
 task.spawn(function()
-	repeat task.wait() until game:IsLoaded() do end
+	while true do
+		task.wait(POLL_INTERVAL)
+		
+		local character = LocalPlayer.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not root then continue end
+		
+		local closestModel, closestId, closestEntry, closestDist
+		
+		for _, model in ipairs(CollectionService:GetTagged("Doors")) do
+			local primary = model.PrimaryPart
+			if not primary then return end
+			
+			local dist = (primary.Position - root.Position).Magnitude
+			--print(dist)
+			
+			if dist < DISTANCE and (not closestDist or dist < closestDist) then
+				--print(1)
+				local id, entry = getStateByModel(model)
+				if id then
+					closestModel, closestId, closestEntry, closestDist = model, id, entry, dist
+				end
+			end
+		end
+		
+		if closestModel ~= selected.Model then
+			clearInteractions()
+			selected.Model = closestModel
+			selected.Id = closestId
+		end
+		
+		if not selected.Model then continue end
+		
+		local stateData = closestEntry.Atom()
+		local legal = getAvailableActions(stateData)
+		
+		local legalSet = {}
+		for _, name in ipairs(legal) do legalSet[name] = true end
+		
+		for name in pairs(selected.Interactions) do
+			if not legalSet[name] then
+				setPromptVisible(selected.Model, name, false)
+				selected.Interactions[name] = nil
+			end
+		end
+		
+		for _, name in ipairs(legal) do
+			if not selected.Interactions[name] then
+				setInteraction(selected.Model, name, function()
+					Remotes.Action:InvokeServer({ Id = selected.Id, Action = name })
+				end)
+			end
+		end
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if not selected.Model then return end
 	
-	Remotes.RequestState:FireServer()
+	for name, interaction in pairs(selected.Interactions) do
+		if interaction.Key == input.KeyCode and not interaction.Exhausted then
+			interaction.Exhausted = true
+			interaction.Callback()
+			task.delay(INPUT_DEBOUNCE, function()
+				if selected.Interactions[name] then
+					selected.Interactions[name].Exhausted = false
+				end
+			end)
+		end
+	end
 end)
